@@ -1,0 +1,12 @@
+{
+  "name": "hora-bela",
+  "version": "1.0.0",
+  "description": "Hora Bela — agenda online para profissionais de beleza (SaaS, não é marketplace)",
+  "private": true,
+  "main": "src/server.js",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "TZ=America/Sao_Paulo node test/logic.test.js && TZ=America/Sao_Paulo node test/e2e.test.js"
+  }
+}
