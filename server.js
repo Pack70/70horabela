@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const HB = require('./logic.js');
 const D = require('./db.js');
+let MP; try { MP = require('./mp.js'); } catch (_) { MP = require('../mp.js'); } // repo plano na Render: mp.js fica na raiz
 const { all, get, run, tx } = D;
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -69,11 +70,11 @@ const planOf = async (userId) => {
 };
 // Período de acesso: o teste grátis (plano "free") e planos com prazo têm um fim em subscriptions.renews_at.
 const accessOf = async (userId) => {
-  const s = await get('SELECT plan_id, renews_at FROM subscriptions WHERE user_id = ?', userId);
+  const s = await get('SELECT plan_id, renews_at, provider, status FROM subscriptions WHERE user_id = ?', userId);
   const planId = s ? s.plan_id : 'free';
   const ends = s && s.renews_at ? Number(s.renews_at) : null;
   const now = Date.now();
-  return { planId, trial: planId === 'free' && ends !== null, endsAt: ends, expired: ends !== null && ends < now, daysLeft: ends === null ? null : Math.max(0, Math.ceil((ends - now) / 864e5)) };
+  return { planId, trial: planId === 'free' && ends !== null, endsAt: ends, expired: ends !== null && ends < now, recurring: !!(s && s.provider === 'mercadopago' && s.status === 'active'), provider: s ? s.provider : 'manual', renewing: !!(s && s.status === 'active' && s.provider !== 'manual'), daysLeft: ends === null ? null : Math.max(0, Math.ceil((ends - now) / 864e5)) };
 };
 const endOfDayMs = (dateStr) => HB.parseD(dateStr).getTime() + 864e5 - 1;
 const planPublic = (p) => { const d = JSON.parse(p.data || '{}'); return { id: p.id, name: p.name, priceCents: p.price_cents, tagline: d.tagline || '', highlight: !!d.highlight, features: d.features || [], limits: d.limits || {} }; };
@@ -108,7 +109,8 @@ const readBody = (req) => new Promise((resolve, reject) => {
   req.on('data', (c) => { size += c.length; if (size > 6 * 1024 * 1024) { reject(new HttpError(413, 'Arquivo muito grande.')); req.destroy(); } else chunks.push(c); });
   req.on('end', () => {
     if (!size) return resolve({});
-    try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (_) { reject(bad('JSON inválido.')); }
+    req.rawBody = Buffer.concat(chunks);
+    try { resolve(JSON.parse(req.rawBody.toString('utf8'))); } catch (_) { reject(bad('JSON inválido.')); }
   });
   req.on('error', reject);
 });
@@ -119,7 +121,7 @@ const send = (res, status, data, headers = {}) => {
   res.end(body);
 };
 
-const PAYWALL_OPEN = new Set(['/api/account/password', '/api/account/email']);
+const PAYWALL_OPEN = new Set(['/api/account/password', '/api/account/email', '/api/billing/checkout', '/api/billing/sync', '/api/billing/cancel']);
 const clientIp = (req) => (TRUST_PROXY && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || 'ip';
 
 async function handleApi(req, res, url) {
@@ -152,7 +154,7 @@ async function handleApi(req, res, url) {
 /* =================== AUTENTICAÇÃO =================== */
 route('GET', '/api/config', null, async () => {
   const s = await D.getSettings();
-  return { siteName: s.siteName, baseUrl: s.baseUrl, supportWhatsapp: s.supportWhatsapp, registrationOpen: s.registrationOpen === '1', trialDays: Number(s.trialDays) || 7, plans: (await all('SELECT * FROM plans WHERE active=1 ORDER BY position')).map(planPublic) };
+  return { siteName: s.siteName, baseUrl: s.baseUrl, supportWhatsapp: s.supportWhatsapp, registrationOpen: s.registrationOpen === '1', trialDays: Number(s.trialDays) || 7, billing: MP.enabled() || (await caktoCfg()).enabled, providers: { mercadopago: MP.enabled(), cakto: Object.keys((await caktoCfg()).plans).filter(() => !!process.env.CAKTO_WEBHOOK_SECRET) }, plans: (await all('SELECT * FROM plans WHERE active=1 ORDER BY position')).map(planPublic) };
 });
 
 route('POST', '/api/auth/register', null, async ({ body, res, ip }) => {
@@ -220,6 +222,168 @@ route('POST', '/api/account/email', 'any', async ({ body, user }) => {
   if (!HB.validEmail(email)) throw bad('E-mail inválido.', 'email');
   if (await get('SELECT 1 FROM users WHERE email = ? AND id <> ?', email, user.id)) throw bad('Esse e-mail já está em uso.', 'email');
   await run('UPDATE users SET email = ? WHERE id = ?', email, user.id);
+});
+
+
+/* =================== COBRANÇA (Mercado Pago — assinatura recorrente) =================== */
+const GRACE_MS = 3 * 864e5; // tolerância após o vencimento, para o pagamento compensar
+const publicBase = async (req) => {
+  const s = await D.getSettings();
+  if (s.baseUrl) return s.baseUrl;
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, '');
+  if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL.replace(/\/+$/, '');
+  const proto = TRUST_PROXY && req.headers['x-forwarded-proto'] ? String(req.headers['x-forwarded-proto']).split(',')[0].trim() : 'http';
+  return proto + '://' + (TRUST_PROXY && req.headers['x-forwarded-host'] ? String(req.headers['x-forwarded-host']).split(',')[0].trim() : req.headers.host);
+};
+// Traduz o estado de uma assinatura do Mercado Pago para o acesso da profissional. Idempotente.
+const applyPreapproval = async (pre, { paid = false } = {}) => {
+  const [userId, planId] = String(pre.external_reference || '').split(':');
+  const user = userId && await get("SELECT id FROM users WHERE id = ? AND role = 'pro'", userId);
+  const plan = planId && await get('SELECT id FROM plans WHERE id = ? AND price_cents > 0', planId);
+  if (!user || !plan) return false;
+  const cur = await get('SELECT * FROM subscriptions WHERE user_id = ?', userId);
+  const now = Date.now();
+  if (pre.status === 'authorized') {
+    const next = Date.parse(pre.next_payment_date) || 0;
+    let ends = (paid ? Math.max(next, now + 28 * 864e5) : Math.max(next, now + 864e5)) + GRACE_MS;
+    if (cur && cur.renews_at) ends = Math.max(ends, Number(cur.renews_at));
+    if (cur && cur.provider === 'mercadopago' && cur.status === 'active' && cur.provider_ref && cur.provider_ref !== pre.id) {
+      try { await MP.cancelPreapproval(cur.provider_ref); } catch (e) { await D.logError('mp cancel old', e); }
+    }
+    await run("INSERT INTO subscriptions (user_id,plan_id,status,provider,provider_ref,started_at,renews_at) VALUES (?,?, 'active','mercadopago',?,?,?) ON CONFLICT(user_id) DO UPDATE SET plan_id = excluded.plan_id, status = 'active', provider = 'mercadopago', provider_ref = excluded.provider_ref, renews_at = excluded.renews_at", userId, planId, String(pre.id), now, ends);
+    return true;
+  }
+  if ((pre.status === 'cancelled' || pre.status === 'paused') && cur && cur.provider === 'mercadopago' && cur.provider_ref === String(pre.id)) {
+    await run("UPDATE subscriptions SET status = 'cancelled' WHERE user_id = ?", userId); // o acesso segue até renews_at
+    return true;
+  }
+  return false;
+};
+
+route('POST', '/api/billing/checkout', 'pro', async ({ body, user, req }) => {
+  rateLimit('chk:' + user.id, 10, 3600e3);
+  const plan = await get('SELECT * FROM plans WHERE id = ? AND active = 1 AND price_cents > 0', String(body.planId || ''));
+  if (!plan) throw bad('Plano inválido.');
+  if (body.provider === 'cakto') {
+    const c = await caktoCfg();
+    if (!c.enabled || !c.plans[plan.id]) throw new HttpError(503, 'Este meio de pagamento não está disponível para o plano escolhido.');
+    const u = new URL(c.plans[plan.id].url); u.searchParams.set('email', user.email);
+    return { url: u.toString() };
+  }
+  if (!MP.enabled()) throw new HttpError(503, 'O pagamento online ainda não está disponível. Fale com o suporte.');
+  const base = await publicBase(req);
+  const siteName = (await D.getSettings()).siteName;
+  let pre;
+  try {
+    pre = await MP.createPreapproval({
+      reason: siteName + ' — Plano ' + plan.name, externalReference: user.id + ':' + plan.id, payerEmail: user.email,
+      amount: plan.price_cents / 100, backUrl: base + '/painel?assinatura=retorno', notificationUrl: base + '/api/billing/webhook',
+    });
+  } catch (e) { await D.logError('mp checkout', e); throw new HttpError(502, 'Não foi possível iniciar o pagamento agora. Tente de novo em instantes.'); }
+  if (!pre.init_point) throw new HttpError(502, 'Não foi possível iniciar o pagamento agora. Tente de novo em instantes.');
+  return { url: pre.init_point };
+});
+
+// Confere no Mercado Pago se existe assinatura autorizada (usado ao voltar do checkout, sem esperar o webhook).
+route('POST', '/api/billing/sync', 'pro', async ({ user }) => {
+  if (!MP.enabled()) return { active: false };
+  rateLimit('sync:' + user.id, 30, 3600e3);
+  let active = false;
+  try {
+    for (const p of await all('SELECT id FROM plans WHERE price_cents > 0 AND active = 1')) {
+      const list = (await MP.searchPreapprovals(user.id + ':' + p.id)).filter((x) => x.status === 'authorized');
+      list.sort((a, b) => (Date.parse(b.date_created) || 0) - (Date.parse(a.date_created) || 0));
+      if (list[0] && await applyPreapproval(list[0])) active = true;
+    }
+  } catch (e) { await D.logError('mp sync', e); throw new HttpError(502, 'Não foi possível consultar o pagamento agora. Tente de novo em instantes.'); }
+  return { active };
+});
+
+route('POST', '/api/billing/cancel', 'pro', async ({ user }) => {
+  const sub = await get('SELECT * FROM subscriptions WHERE user_id = ?', user.id);
+  if (!sub || sub.provider !== 'mercadopago' || !sub.provider_ref || sub.status !== 'active') throw bad('Você não tem uma assinatura recorrente ativa.');
+  try { await MP.cancelPreapproval(sub.provider_ref); } catch (e) { await D.logError('mp cancel', e); throw new HttpError(502, 'Não foi possível cancelar agora. Tente de novo em instantes.'); }
+  await run("UPDATE subscriptions SET status = 'cancelled' WHERE user_id = ?", user.id);
+  return { ok: true, endsAt: sub.renews_at ? Number(sub.renews_at) : null };
+});
+
+// Webhook do Mercado Pago: nunca confiamos no corpo; sempre rebuscamos o recurso na API com o nosso token.
+route('POST', '/api/billing/webhook', null, async ({ req, body, query }) => {
+  if (!MP.enabled()) return { ok: true };
+  const type = String(body.type || query.type || query.topic || '');
+  const id = String((body.data && body.data.id) || query['data.id'] || query.id || '');
+  if (!id || !/^[\w-]{1,64}$/.test(id)) return { ok: true };
+  if (!MP.verifySignature(req.headers, id)) throw new HttpError(401, 'Assinatura inválida.');
+  if (type === 'subscription_preapproval' || type === 'preapproval') {
+    await applyPreapproval(await MP.getPreapproval(id));
+  } else if (type === 'subscription_authorized_payment' || type === 'authorized_payment') {
+    const ap = await MP.getAuthorizedPayment(id);
+    if (ap.preapproval_id) await applyPreapproval(await MP.getPreapproval(ap.preapproval_id), { paid: !!(ap.payment ? ap.payment.status === 'approved' : ap.status === 'processed') });
+  }
+  return { ok: true };
+});
+
+
+/* ---------- Cakto (checkout externo + webhook) ---------- */
+// Cada plano pago tem um link de checkout da Cakto (Admin → Sistema). A Cakto avisa por webhook; o e-mail da compra identifica a conta.
+async function caktoCfg() {
+  const s = await D.getSettings(); const plans = {};
+  for (const p of await all('SELECT id FROM plans WHERE price_cents > 0 AND active = 1')) {
+    const url = s['caktoUrl_' + p.id];
+    if (url && /^https:\/\/[^\s]+$/.test(url)) plans[p.id] = { url, offer: String(s['caktoOffer_' + p.id] || '').trim() };
+  }
+  return { enabled: !!process.env.CAKTO_WEBHOOK_SECRET && Object.keys(plans).length > 0, plans };
+}
+const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+const caktoAuthentic = (req, body) => {
+  const secret = process.env.CAKTO_WEBHOOK_SECRET || '';
+  if (!secret) return false;
+  const sig = String(req.headers['x-cakto-signature'] || '').replace(/^v1=/, ''), ts = String(req.headers['x-cakto-timestamp'] || '');
+  if (sig && ts) {
+    const n = Number(ts); const ms = n < 1e12 ? n * 1000 : n;
+    if (!Number.isFinite(ms) || Math.abs(Date.now() - ms) > 5 * 60e3) return false;
+    const mac = () => crypto.createHmac('sha256', secret).update(ts + '.').update(req.rawBody || '');
+    const hex = mac().digest('hex'), b64 = mac().digest('base64');
+    return safeEq(sig, hex) || safeEq(sig, b64);
+  }
+  return typeof body.secret === 'string' && safeEq(body.secret, secret);
+};
+const CAKTO_PAID = new Set(['purchase_approved', 'subscription_renewed', 'subscription_late_recovered']);
+const CAKTO_STOP = new Set(['subscription_canceled', 'subscription_paused']);
+const CAKTO_CUT = new Set(['refund', 'chargeback']);
+const caktoPlanFor = async (d) => {
+  const c = await caktoCfg();
+  const ids = [d.offer && d.offer.id, d.product && d.product.id].filter(Boolean).map(String);
+  for (const [pid, v] of Object.entries(c.plans)) if (v.offer && ids.includes(v.offer)) return pid;
+  const cents = [d.offer && d.offer.price, d.baseAmount, d.amount].map((x) => Math.round(Number(x) * 100)).filter((x) => x > 0);
+  for (const pid of Object.keys(c.plans)) { const pl = await get('SELECT price_cents FROM plans WHERE id = ?', pid); if (pl && cents.includes(pl.price_cents)) return pid; }
+  return null;
+};
+const handleCakto = async (event, d) => {
+  const email = String((d.customer && d.customer.email) || '').trim().toLowerCase();
+  const user = email && await get("SELECT id FROM users WHERE lower(email) = ? AND role = 'pro'", email);
+  if (!user) { await D.logError('cakto ' + event, new Error('Nenhuma conta com o e-mail da compra: ' + email + ' (pedido ' + d.id + ')')); return; }
+  const cur = await get('SELECT * FROM subscriptions WHERE user_id = ?', user.id);
+  const now = Date.now();
+  if (CAKTO_PAID.has(event)) {
+    if (d.status && d.status !== 'paid') return;
+    const planId = await caktoPlanFor(d);
+    if (!planId) { await D.logError('cakto ' + event, new Error('Plano não identificado (oferta ' + (d.offer && d.offer.id) + ', valor ' + d.amount + '). Preencha o ID da oferta em Admin → Sistema.')); return; }
+    const ends = Math.max(cur && cur.renews_at ? Number(cur.renews_at) : 0, now + 33 * 864e5); // 30 dias + 3 de tolerância; nunca soma, então é idempotente
+    if (cur && cur.provider === 'mercadopago' && cur.status === 'active' && cur.provider_ref && MP.enabled()) { try { await MP.cancelPreapproval(cur.provider_ref); } catch (e) { await D.logError('mp cancel (troca p/ cakto)', e); } }
+    const ref = String(d.subscription && typeof d.subscription === 'object' && d.subscription.id ? d.subscription.id : d.id || '');
+    await run("INSERT INTO subscriptions (user_id,plan_id,status,provider,provider_ref,started_at,renews_at) VALUES (?,?, 'active','cakto',?,?,?) ON CONFLICT(user_id) DO UPDATE SET plan_id = excluded.plan_id, status = 'active', provider = 'cakto', provider_ref = excluded.provider_ref, renews_at = excluded.renews_at", user.id, planId, ref, now, ends);
+  } else if (CAKTO_STOP.has(event) && cur && cur.provider === 'cakto') {
+    await run("UPDATE subscriptions SET status = 'cancelled' WHERE user_id = ?", user.id); // acesso segue até renews_at
+  } else if (CAKTO_CUT.has(event) && cur && cur.provider === 'cakto') {
+    await run("UPDATE subscriptions SET status = 'cancelled', renews_at = ? WHERE user_id = ?", now - 1, user.id);
+  }
+};
+route('POST', '/api/billing/cakto', null, async ({ req, body }) => {
+  if (!caktoAuthentic(req, body)) throw new HttpError(401, 'Assinatura inválida.');
+  const event = String(body.event || '');
+  for (const d of [].concat(body.data || [])) if (d && typeof d === 'object') await handleCakto(event, d);
+  return { ok: true };
 });
 
 /* =================== PERFIL / PÁGINA =================== */
@@ -663,6 +827,10 @@ route('PUT', '/api/admin/settings', 'admin', async ({ body }) => {
   if ('baseUrl' in body) { const u = str(body.baseUrl, 120, 'baseUrl').replace(/\/+$/, ''); if (u && !/^https?:\/\/[^\s]+$/.test(u)) throw bad('Use o formato https://seudominio.com', 'baseUrl'); await D.setSetting('baseUrl', u); }
   if ('trialDays' in body) { const n = Number(body.trialDays); if (!Number.isInteger(n) || n < 1 || n > 90) throw bad('Use entre 1 e 90 dias.', 'trialDays'); await D.setSetting('trialDays', n); }
   if ('supportWhatsapp' in body) await D.setSetting('supportWhatsapp', str(body.supportWhatsapp, 20, 'supportWhatsapp'));
+  for (const p of await all('SELECT id FROM plans WHERE price_cents > 0')) {
+    if (('caktoUrl_' + p.id) in body) { const u = str(body['caktoUrl_' + p.id], 300, 'caktoUrl_' + p.id); if (u && !/^https:\/\/[^\s]+$/.test(u)) throw bad('Use o link completo, começando com https://', 'caktoUrl_' + p.id); await D.setSetting('caktoUrl_' + p.id, u); }
+    if (('caktoOffer_' + p.id) in body) await D.setSetting('caktoOffer_' + p.id, str(body['caktoOffer_' + p.id], 80, 'caktoOffer_' + p.id));
+  }
 });
 
 /* =================== ESTÁTICOS E SPA =================== */

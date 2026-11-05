@@ -128,6 +128,13 @@
   };
   App.acts.logout = () => App.logout();
 
+  const payButtons = (p, big) => {
+    const pv = App.cfg.providers || {}; const out = [];
+    if (pv.mercadopago) out.push('<button class="btn ' + (big && p.highlight ? 'btn-primary' : big ? 'btn-primary' : 'btn-line') + ' ' + (big ? 'btn-block' : 'btn-sm') + '" ' + (big ? '' : 'style="justify-self:start" ') + 'data-act="subscribe" data-provider="mercadopago" data-plan="' + esc(p.id) + '">' + (big ? 'Assinar com Mercado Pago' : esc(p.name) + ' — ' + esc(HB.brl(p.priceCents)) + '/mês (Mercado Pago)') + '</button>');
+    if ((pv.cakto || []).includes(p.id)) out.push('<button class="btn ' + (big && !pv.mercadopago ? 'btn-primary' : 'btn-line') + ' ' + (big ? 'btn-block' : 'btn-sm') + '" ' + (big ? '' : 'style="justify-self:start" ') + 'data-act="subscribe" data-provider="cakto" data-plan="' + esc(p.id) + '">' + (big ? 'Assinar com Cakto' : esc(p.name) + ' — ' + esc(HB.brl(p.priceCents)) + '/mês (Cakto)') + '</button>');
+    return out.join('');
+  };
+  const planPayable = (p) => { const pv = App.cfg.providers || {}; return !!pv.mercadopago || (pv.cakto || []).includes(p.id); };
   const supportLink = (text) => App.cfg.supportWhatsapp && HB.normPhone(App.cfg.supportWhatsapp) ? App.waTo(HB.normPhone(App.cfg.supportWhatsapp), text) : '';
   const paywall = () => {
     const a = App.me.access; const u = App.me.user;
@@ -139,12 +146,20 @@
       '<div class="plans" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));max-width:none">' + paid.map((p) => {
         const href = supportLink('Olá! Quero assinar o plano ' + p.name + ' do ' + App.cfg.siteName + '. Meu e-mail: ' + u.email);
         return '<div class="plan' + (p.highlight ? ' hl' : '') + '"><div><h3>' + esc(p.name) + '</h3><p class="muted small">' + esc(p.tagline) + '</p></div><div class="price"><small>R$</small> ' + esc(HB.brl(p.priceCents).replace('R$ ', '')) + ' <small>/mês</small></div><ul>' + p.features.map((f) => '<li>' + ic('check') + '<span>' + esc(f) + '</span></li>').join('') + '</ul>' +
-          (href ? '<a class="btn btn-wa btn-block" target="_blank" rel="noopener" href="' + esc(href) + '">' + ic('whatsapp') + ' Assinar pelo WhatsApp</a>' : '<p class="small muted">Fale com o suporte para ativar este plano.</p>') + '</div>';
+          (planPayable(p) ? payButtons(p, true) + '<p class="tiny muted" style="text-align:center">Pagamento seguro. Cobrança mensal automática, cancele quando quiser.</p>' : href ? '<a class="btn btn-wa btn-block" target="_blank" rel="noopener" href="' + esc(href) + '">' + ic('whatsapp') + ' Assinar pelo WhatsApp</a>' : '<p class="small muted">Fale com o suporte para ativar este plano.</p>') + '</div>';
       }).join('') + '</div>' +
       '<p class="small muted" style="margin-top:18px">Logado como ' + esc(u.email) + '. Depois que o pagamento for confirmado, o acesso é liberado e você já pode entrar de novo.</p>' +
       '<div class="row" style="margin-top:14px"><button class="btn btn-line" data-act="logout">' + ic('logout') + ' Sair</button><button class="btn btn-ghost" data-act="paywall-retry">Já assinei, verificar de novo</button></div></div></div>');
   };
-  App.acts['paywall-retry'] = async () => { await App.loadMe(); App.route(); };
+  App.acts['paywall-retry'] = async (el) => { await App.busy(el, async () => { try { if (App.cfg.billing) await App.post('/api/billing/sync', {}); } catch (e) { App.toast(e.message, true); } await App.loadMe(); App.route(); }); };
+  App.acts.subscribe = (el) => App.busy(el, async () => {
+    try { const r = await App.post('/api/billing/checkout', { planId: el.dataset.plan, provider: el.dataset.provider }); location.href = r.url; await new Promise(() => {}); }
+    catch (e) { App.toast(e.message, true); }
+  });
+  App.acts['cancel-sub'] = async (el) => {
+    if (!confirm('Cancelar a cobrança automática? Você continua com acesso até o fim do período já pago.')) return;
+    await App.busy(el, async () => { try { await App.post('/api/billing/cancel', {}); App.toast('Assinatura cancelada.'); await App.loadMe(); refresh(); } catch (e) { App.toast(e.message, true); } });
+  };
 
   const sections = {};
   const refresh = () => sections[state.section] ? sections[state.section]($('#main'), state.param) : null;
@@ -156,6 +171,10 @@
     if (!u) return App.go('/entrar', true);
     if (u.role !== 'pro') return App.go('/admin', true);
     if (!prof().onboarded) return App.go('/configurar', true);
+    if (/[?&]assinatura=retorno/.test(location.search)) {
+      history.replaceState(null, '', location.pathname);
+      try { const r = await App.post('/api/billing/sync', {}); await App.loadMe(); App.toast(r.active ? 'Assinatura ativa! Obrigada.' : 'Pagamento em análise. Assim que for confirmado, o acesso é liberado.'); } catch (_) { /* segue */ }
+    }
     if (App.me.access && App.me.access.expired) return paywall();
     if (section === undefined) section = '';
     if (section !== 'mais' && !sections[section]) return App.go('/painel', true);
@@ -418,6 +437,13 @@
   App.acts['copy-bio'] = (el) => App.copy(state.bios[+el.dataset.i], 'Texto copiado!');
   App.acts['native-share'] = () => navigator.share({ title: prof().name, text: 'Agende seu horário', url: App.pageUrl(prof().slug) }).catch(() => {});
 
+  const subscribeBlock = (plan, ac) => {
+    const opts = App.cfg.plans.filter((p) => p.priceCents > 0 && planPayable(p) && !(ac && ac.renewing && p.id === plan.id));
+    return (opts.length ? '<div class="stack" style="gap:8px"><b class="small">' + (plan.priceCents ? 'Mudar de plano' : 'Assinar um plano') + '</b>' + opts.map((p) => payButtons(p, false)).join('') + '<p class="tiny muted">Pagamento seguro. Cobrança mensal automática.</p></div>' : '') +
+      (ac && ac.recurring ? '<div><button class="btn btn-ghost btn-sm" data-act="cancel-sub">Cancelar cobrança automática</button></div>' : '') +
+      (ac && ac.renewing && ac.provider === 'cakto' ? '<p class="tiny muted">Assinatura pela Cakto. Para cancelar, use o e-mail de compra da Cakto ou fale com o suporte.</p>' : '');
+  };
+
   /* ---------- Configurações ---------- */
   sections.configuracoes = async (m) => {
     await App.loadMe();
@@ -428,7 +454,7 @@
       '<ul class="small" style="margin:0;padding-left:18px;display:grid;gap:4px">' + plan.features.map((f) => '<li>' + esc(f) + '</li>').join('') + '</ul>' +
       (lim.bookingsPerMonth != null ? '<div><div class="row between small"><span>Solicitações neste mês</span><span>' + usage.bookingsThisMonth + ' de ' + lim.bookingsPerMonth + '</span></div><div class="usage" style="margin-top:6px"><i style="width:' + Math.min(100, usage.bookingsThisMonth / lim.bookingsPerMonth * 100) + '%"></i></div></div>' : '') +
       (App.me.access && App.me.access.endsAt ? '<p class="small">' + (App.me.access.trial ? 'Seu teste grátis termina em <b>' : 'Seu acesso vai até <b>') + HB.dateBR(HB.dstr(new Date(App.me.access.endsAt))) + '</b>.</p>' : '') +
-      (plan.id !== 'premium' ? '<p class="muted small">Para assinar ou mudar de plano, fale com o suporte.</p>' + (supportLink('Olá! Quero assinar um plano do ' + App.cfg.siteName + '. Meu e-mail: ' + user.email) ? '<a class="btn btn-wa btn-sm" style="justify-self:start" target="_blank" rel="noopener" href="' + esc(supportLink('Olá! Quero assinar um plano do ' + App.cfg.siteName + '. Meu e-mail: ' + user.email)) + '">' + ic('whatsapp') + ' Falar com o suporte</a>' : '') : '') + '</div>' +
+      (App.cfg.billing ? subscribeBlock(plan, App.me.access) : (plan.id !== 'premium' ? '<p class="muted small">Para assinar ou mudar de plano, fale com o suporte.</p>' + (supportLink('Olá! Quero assinar um plano do ' + App.cfg.siteName + '. Meu e-mail: ' + user.email) ? '<a class="btn btn-wa btn-sm" style="justify-self:start" target="_blank" rel="noopener" href="' + esc(supportLink('Olá! Quero assinar um plano do ' + App.cfg.siteName + '. Meu e-mail: ' + user.email)) + '">' + ic('whatsapp') + ' Falar com o suporte</a>' : '') : '')) + '</div>' +
       '<form class="card stack" id="f-email"><h3>E-mail de acesso</h3>' + App.field({ name: 'email', label: 'E-mail', type: 'email', value: user.email }) + App.field({ name: 'password', label: 'Confirme sua senha', type: 'password', auto: 'current-password' }) + '<div class="errmsg form-err"></div><div><button class="btn btn-line" type="submit">Atualizar e-mail</button></div></form>' +
       '<form class="card stack" id="f-pw"><h3>Senha</h3>' + App.field({ name: 'current', label: 'Senha atual', type: 'password', auto: 'current-password' }) + App.field({ name: 'next', label: 'Nova senha', type: 'password', auto: 'new-password', hint: 'Mínimo de 8 caracteres.' }) + '<div class="errmsg form-err"></div><div><button class="btn btn-line" type="submit">Trocar senha</button></div></form>' +
       '<form class="card stack" id="f-wa"><h3>WhatsApp de atendimento</h3>' + App.field({ name: 'whatsapp', label: 'WhatsApp com DDD', value: p.whatsapp ? HB.fmtPhone(p.whatsapp) : '', mask: 'phone', inputmode: 'tel', hint: 'Recebe as solicitações de agendamento.' }) + '<div class="errmsg form-err"></div><div><button class="btn btn-line" type="submit">Salvar WhatsApp</button></div></form>' +

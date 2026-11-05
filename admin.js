@@ -89,12 +89,14 @@
       App.field({ name: 'baseUrl', label: 'Endereço público (domínio próprio)', value: s.baseUrl, ph: 'https://horabela.com.br', hint: 'Usado nos links compartilhados e nas prévias do Instagram/WhatsApp. Deixe vazio para usar o endereço atual.' }) +
       App.field({ name: 'supportWhatsapp', label: 'WhatsApp do suporte e das assinaturas', value: s.supportWhatsapp, max: 20, mask: 'phone', hint: 'Aparece na tela de assinatura para quem terminou o teste. Preencha para receber os pedidos de assinatura.' }) +
       App.field({ name: 'trialDays', label: 'Dias de teste grátis', value: s.trialDays, inputmode: 'numeric', hint: 'Vale para novos cadastros.' }) +
+      '<h3 style="margin-top:6px">Cakto (pagamento)</h3><p class="small muted">Crie um produto de assinatura mensal na Cakto para cada plano, cole o link do checkout e cadastre o webhook <b>' + esc(location.origin) + '/api/billing/cakto</b> na Cakto. O ID da oferta é opcional (ajuda a identificar o plano; sem ele usamos o valor).</p>' +
+      App.cfg.plans.filter((p) => p.priceCents > 0).map((p) => App.field({ name: 'caktoUrl_' + p.id, label: 'Plano ' + p.name + ' — link do checkout', value: s['caktoUrl_' + p.id] || '', ph: 'https://pay.cakto.com.br/...', max: 300 }) + App.field({ name: 'caktoOffer_' + p.id, label: 'Plano ' + p.name + ' — ID da oferta (opcional)', value: s['caktoOffer_' + p.id] || '', max: 80 })).join('') +
       '<label class="row"><span class="switch"><input type="checkbox" name="registrationOpen" ' + (s.registrationOpen === '1' ? 'checked' : '') + '><i></i></span> Aceitar novos cadastros</label><div class="errmsg form-err"></div><div><button class="btn btn-primary" type="submit">Salvar configurações</button></div></form>';
     const f = $('#f-sys');
     f.addEventListener('submit', async (e) => {
       e.preventDefault(); App.showErr(f);
       await App.busy(f.querySelector('button[type=submit]'), async () => {
-        try { await App.put('/api/admin/settings', { siteName: f.siteName.value, baseUrl: f.baseUrl.value, supportWhatsapp: f.supportWhatsapp.value, trialDays: Number(f.trialDays.value), registrationOpen: f.registrationOpen.checked }); App.cfg.siteName = f.siteName.value; App.toast('Configurações salvas.'); }
+        try { await App.put('/api/admin/settings', { siteName: f.siteName.value, baseUrl: f.baseUrl.value, supportWhatsapp: f.supportWhatsapp.value, trialDays: Number(f.trialDays.value), registrationOpen: f.registrationOpen.checked, ...Object.fromEntries(App.cfg.plans.filter((p) => p.priceCents > 0).flatMap((p) => [['caktoUrl_' + p.id, f['caktoUrl_' + p.id].value], ['caktoOffer_' + p.id, f['caktoOffer_' + p.id].value]])) }); App.cfg.siteName = f.siteName.value; App.toast('Configurações salvas.'); }
         catch (err) { App.showErr(f, err); }
       });
     });
