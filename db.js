@@ -1,17 +1,111 @@
-'use strict';
-const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const HB = require('./logic.js');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
-fs.mkdirSync(path.join(DATA_DIR, 'uploads'), { recursive: true });
+const TURSO_URL = (process.env.TURSO_URL || process.env.TURSO_DATABASE_URL || '').replace(/^libsql:\/\//, 'https://').replace(/\/+$/, '');
+const TURSO_TOKEN = process.env.TURSO_TOKEN || process.env.TURSO_AUTH_TOKEN || '';
+const MODE = TURSO_URL ? 'turso' : 'local';
 
-const db = new DatabaseSync(process.env.DB_FILE || path.join(DATA_DIR, 'horabela.db'));
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+/* ---------- Adaptador local (SQLite embutido no Node) ---------- */
+let local = null;
+if (MODE === 'local') {
+  const { DatabaseSync } = require('node:sqlite');
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  local = new DatabaseSync(process.env.DB_FILE || path.join(DATA_DIR, 'horabela.db'));
+  local.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+}
 
-db.exec(`
+/* ---------- Adaptador Turso (HTTP, protocolo Hrana v2 /v2/pipeline) ---------- */
+const encArg = (v) => {
+  if (v === null || v === undefined) return { type: 'null' };
+  if (typeof v === 'boolean') return { type: 'integer', value: v ? '1' : '0' };
+  if (typeof v === 'number') return Number.isInteger(v) ? { type: 'integer', value: String(v) } : { type: 'float', value: v };
+  if (Buffer.isBuffer(v)) return { type: 'blob', base64: v.toString('base64') };
+  return { type: 'text', value: String(v) };
+};
+const decVal = (c) => {
+  if (!c || c.type === 'null') return null;
+  if (c.type === 'integer') return Number(c.value);
+  if (c.type === 'float') return Number(c.value);
+  if (c.type === 'blob') return Buffer.from(c.base64, 'base64');
+  return c.value;
+};
+async function pipeline(base, baton, requests) {
+  let res;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      res = await fetch(base + '/v2/pipeline', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TURSO_TOKEN }, body: JSON.stringify({ baton: baton || null, requests }) });
+      if (res.status >= 500 && !baton && attempt < 2) { await new Promise((r) => setTimeout(r, 300 * (attempt + 1))); continue; }
+      break;
+    } catch (e) { if (baton || attempt === 2) throw e; await new Promise((r) => setTimeout(r, 300 * (attempt + 1))); }
+  }
+  const text = await res.text();
+  let data; try { data = JSON.parse(text); } catch (_) { throw new Error('Turso HTTP ' + res.status + ': ' + text.slice(0, 200)); }
+  if (!res.ok) throw new Error('Turso HTTP ' + res.status + ': ' + (data.error || text).toString().slice(0, 200));
+  for (const r of data.results) if (r.type === 'error') throw new Error('SQL: ' + (r.error && r.error.message));
+  return data;
+}
+const rowsOf = (result) => result.rows.map((row) => { const o = {}; result.cols.forEach((c, i) => { o[c.name] = decVal(row[i]); }); return o; });
+
+// uma "conexão" mantém o baton durante uma transação
+class TursoConn {
+  constructor() { this.baton = null; this.base = TURSO_URL; }
+  async exec(sql, args) {
+    const data = await pipeline(this.base, this.baton, [{ type: 'execute', stmt: { sql, args: (args || []).map(encArg) } }]);
+    if (data.baton !== undefined) this.baton = data.baton;
+    if (data.base_url) this.base = String(data.base_url).replace(/\/+$/, '');
+    return data.results[0].response.result;
+  }
+  async close() { if (this.baton) { try { await pipeline(this.base, this.baton, [{ type: 'close' }]); } catch (_) { /* ignore */ } this.baton = null; } }
+}
+
+/* ---------- API única: all / get / run / tx ---------- */
+const als = new AsyncLocalStorage();
+let txGate = null; // evita que consultas avulsas entrem numa transação aberta (modo local)
+const waitGate = async () => { while (txGate) await txGate; };
+
+async function exec(sql, args) {
+  const conn = als.getStore();
+  if (conn && conn.kind === 'turso') return conn.c.exec(sql, args);
+  if (MODE === 'turso') { const d = await pipeline(TURSO_URL, null, [{ type: 'execute', stmt: { sql, args: (args || []).map(encArg) } }, { type: 'close' }]); return d.results[0].response.result; }
+  if (!conn) await waitGate();
+  const st = local.prepare(sql);
+  if (/^\s*(select|with|pragma)/i.test(sql)) return { rows: st.all(...(args || [])) };
+  const r = st.run(...(args || []));
+  return { changes: Number(r.changes) };
+}
+const all = async (sql, ...p) => { const r = await exec(sql, p); return MODE === 'turso' ? rowsOf(r) : r.rows; };
+const get = async (sql, ...p) => (await all(sql, ...p))[0];
+const run = async (sql, ...p) => { const r = await exec(sql, p); return { changes: MODE === 'turso' ? r.affected_row_count : r.changes }; };
+
+let txQueue = Promise.resolve();
+const tx = (fn) => {
+  const result = txQueue.then(async () => {
+    let release; txGate = new Promise((r) => { release = r; });
+    try {
+      if (MODE === 'turso') {
+        const c = new TursoConn();
+        try {
+          await c.exec('BEGIN IMMEDIATE');
+          const out = await als.run({ kind: 'turso', c }, fn);
+          await c.exec('COMMIT');
+          return out;
+        } catch (e) { try { await c.exec('ROLLBACK'); } catch (_) { /* ignore */ } throw e; }
+        finally { await c.close(); }
+      }
+      local.exec('BEGIN IMMEDIATE');
+      try { const out = await als.run({ kind: 'local' }, fn); local.exec('COMMIT'); return out; }
+      catch (e) { try { local.exec('ROLLBACK'); } catch (_) { /* ignore */ } throw e; }
+    } finally { txGate = null; release(); }
+  });
+  txQueue = result.catch(() => {});
+  return result;
+};
+
+const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
@@ -132,15 +226,20 @@ CREATE TABLE IF NOT EXISTS error_logs (
   stack TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-`);
+CREATE TABLE IF NOT EXISTS images (
+  path TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  data TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`;
 
-const all = (sql, ...p) => db.prepare(sql).all(...p);
-const get = (sql, ...p) => db.prepare(sql).get(...p);
-const run = (sql, ...p) => db.prepare(sql).run(...p);
-const tx = (fn) => {
-  db.exec('BEGIN IMMEDIATE');
-  try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; }
-};
+async function initSchema() {
+  if (MODE === 'turso') {
+    await pipeline(TURSO_URL, null, [{ type: 'sequence', sql: SCHEMA }, { type: 'close' }]);
+  } else local.exec(SCHEMA);
+}
 
 /* ---------- Senhas ---------- */
 const hashPassword = (pw) => {
@@ -158,33 +257,34 @@ const checkPassword = (pw, stored) => {
 const DUMMY_HASH = hashPassword('dummy-password-for-timing');
 
 /* ---------- Seeds ---------- */
-const seedPlans = () => {
-  if (get('SELECT COUNT(*) n FROM plans').n) return;
-  HB.DEFAULT_PLANS.forEach((p, i) => {
+const seedPlans = async () => {
+  if ((await get('SELECT COUNT(*) n FROM plans')).n) return;
+  let i = 0;
+  for (const p of HB.DEFAULT_PLANS) {
     const { id, name, priceCents, active, ...rest } = p;
-    run('INSERT INTO plans (id,name,price_cents,active,position,data) VALUES (?,?,?,?,?,?)', id, name, priceCents, active ? 1 : 0, i, JSON.stringify(rest));
-  });
+    await run('INSERT INTO plans (id,name,price_cents,active,position,data) VALUES (?,?,?,?,?,?)', id, name, priceCents, active ? 1 : 0, i++, JSON.stringify(rest));
+  }
 };
 const DEFAULT_SETTINGS = { siteName: 'Hora Bela', registrationOpen: '1', supportWhatsapp: '', baseUrl: '' };
-const getSettings = () => {
+const getSettings = async () => {
   const s = { ...DEFAULT_SETTINGS };
-  for (const r of all('SELECT key,value FROM settings')) s[r.key] = r.value;
+  for (const r of await all('SELECT key,value FROM settings')) s[r.key] = r.value;
   return s;
 };
 const setSetting = (k, v) => run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', k, String(v));
 
-const seedAdmin = () => {
-  if (get("SELECT id FROM users WHERE role='admin'")) return null;
+const seedAdmin = async () => {
+  if (await get("SELECT id FROM users WHERE role='admin'")) return null;
   const email = (process.env.ADMIN_EMAIL || 'admin@horabela.local').toLowerCase();
   const password = process.env.ADMIN_PASSWORD || crypto.randomBytes(9).toString('base64url');
-  run("INSERT INTO users (id,email,pass_hash,role,created_at) VALUES (?,?,?,'admin',?)", HB.uid('usr'), email, hashPassword(password), Date.now());
+  await run("INSERT INTO users (id,email,pass_hash,role,created_at) VALUES (?,?,?,'admin',?)", HB.uid('usr'), email, hashPassword(password), Date.now());
   return { email, password, generated: !process.env.ADMIN_PASSWORD };
 };
 
-const logError = (route, err) => {
-  try { run('INSERT INTO error_logs (at,route,message,stack) VALUES (?,?,?,?)', Date.now(), route, String(err && err.message || err).slice(0, 500), String(err && err.stack || '').slice(0, 3000)); } catch (_) { /* ignore */ }
+const logError = async (route, err) => {
+  try { await run('INSERT INTO error_logs (at,route,message,stack) VALUES (?,?,?,?)', Date.now(), route, String(err && err.message || err).slice(0, 500), String(err && err.stack || '').slice(0, 3000)); } catch (_) { /* ignore */ }
 };
 
-seedPlans();
+const init = async () => { await initSchema(); await seedPlans(); };
 
-module.exports = { db, all, get, run, tx, hashPassword, checkPassword, DUMMY_HASH, getSettings, setSetting, seedAdmin, logError, DATA_DIR };
+module.exports = { MODE, init, all, get, run, tx, hashPassword, checkPassword, DUMMY_HASH, getSettings, setSetting, seedAdmin, logError, DATA_DIR };
