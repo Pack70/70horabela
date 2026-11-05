@@ -12,6 +12,7 @@
     let data;
     try { data = await App.get('/api/public/' + encodeURIComponent(slug)); } catch (e) { if (e.status === 404) return notFound(); App.mount('<div class="notfound"><div><h1>Ops!</h1><p class="muted">' + esc(e.message) + '</p></div></div>'); return; }
     const p = data.profile;
+    if (data.unavailable) { App.mount('<div class="notfound"><div class="stack" style="justify-items:center;max-width:420px"><div class="avatar" style="width:84px;height:84px">' + (p.avatar ? '<img src="' + esc(p.avatar) + '" alt="">' : esc((p.name || 'M').charAt(0).toUpperCase())) + '</div><h1 style="font-size:1.8rem">' + esc(p.business || p.name) + '</h1><p class="muted">A agenda online está temporariamente indisponível. Tente novamente mais tarde ou fale diretamente com a profissional.</p></div></div>'); return; }
     document.title = (p.business || p.name) + ' — Agende seu horário';
     const accent = p.color ? 'style="--accent:' + esc(p.color) + ';--accent-ink:' + HB.contrastOn(p.color) + '"' : '';
     const initial = (p.name || 'M').charAt(0).toUpperCase();

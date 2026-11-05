@@ -67,6 +67,15 @@ const planOf = async (userId) => {
   const data = JSON.parse(row.data || '{}');
   return { id: row.id, name: row.name, priceCents: row.price_cents, limits: data.limits || {}, features: data.features || [] };
 };
+// Período de acesso: o teste grátis (plano "free") e planos com prazo têm um fim em subscriptions.renews_at.
+const accessOf = async (userId) => {
+  const s = await get('SELECT plan_id, renews_at FROM subscriptions WHERE user_id = ?', userId);
+  const planId = s ? s.plan_id : 'free';
+  const ends = s && s.renews_at ? Number(s.renews_at) : null;
+  const now = Date.now();
+  return { planId, trial: planId === 'free' && ends !== null, endsAt: ends, expired: ends !== null && ends < now, daysLeft: ends === null ? null : Math.max(0, Math.ceil((ends - now) / 864e5)) };
+};
+const endOfDayMs = (dateStr) => HB.parseD(dateStr).getTime() + 864e5 - 1;
 const planPublic = (p) => { const d = JSON.parse(p.data || '{}'); return { id: p.id, name: p.name, priceCents: p.price_cents, tagline: d.tagline || '', highlight: !!d.highlight, features: d.features || [], limits: d.limits || {} }; };
 
 /* ---------- Sessões ---------- */
@@ -91,7 +100,7 @@ const routes = [];
 const route = (method, pattern, auth, handler) => {
   const keys = [];
   const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
-  routes.push({ method, re, keys, auth, handler });
+  routes.push({ method, re, keys, auth, handler, pattern });
 };
 
 const readBody = (req) => new Promise((resolve, reject) => {
@@ -110,6 +119,7 @@ const send = (res, status, data, headers = {}) => {
   res.end(body);
 };
 
+const PAYWALL_OPEN = new Set(['/api/account/password', '/api/account/email']);
 const clientIp = (req) => (TRUST_PROXY && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || 'ip';
 
 async function handleApi(req, res, url) {
@@ -133,6 +143,7 @@ async function handleApi(req, res, url) {
     if (user.status !== 'active') throw new HttpError(403, 'Esta conta está suspensa. Fale com o suporte.');
     if (r.auth === 'admin' && user.role !== 'admin') throw new HttpError(403, 'Acesso restrito.');
     if (r.auth === 'pro' && user.role !== 'pro') throw new HttpError(403, 'Acesso restrito às profissionais.');
+    if (user.role === 'pro' && !PAYWALL_OPEN.has(r.pattern) && (await accessOf(user.id)).expired) throw new HttpError(402, 'Seu período de acesso terminou. Assine um plano para continuar usando a agenda.');
   }
   const out = await r.handler({ req, res, params, query: Object.fromEntries(url.searchParams), body, user, ip: clientIp(req) });
   send(res, 200, out === undefined ? { ok: true } : out);
@@ -141,7 +152,7 @@ async function handleApi(req, res, url) {
 /* =================== AUTENTICAÇÃO =================== */
 route('GET', '/api/config', null, async () => {
   const s = await D.getSettings();
-  return { siteName: s.siteName, baseUrl: s.baseUrl, supportWhatsapp: s.supportWhatsapp, registrationOpen: s.registrationOpen === '1', plans: (await all('SELECT * FROM plans WHERE active=1 ORDER BY position')).map(planPublic) };
+  return { siteName: s.siteName, baseUrl: s.baseUrl, supportWhatsapp: s.supportWhatsapp, registrationOpen: s.registrationOpen === '1', trialDays: Number(s.trialDays) || 7, plans: (await all('SELECT * FROM plans WHERE active=1 ORDER BY position')).map(planPublic) };
 });
 
 route('POST', '/api/auth/register', null, async ({ body, res, ip }) => {
@@ -156,10 +167,11 @@ route('POST', '/api/auth/register', null, async ({ body, res, ip }) => {
   const ne = HB.nameError(name); if (ne) throw bad(ne, 'name');
   if (await get('SELECT 1 FROM users WHERE email = ?', email)) throw bad('Já existe uma conta com esse e-mail.', 'email');
   const id = HB.uid('usr');
+  const trialDays = Number((await D.getSettings()).trialDays) || 7;
   await tx(async () => {
     await run('INSERT INTO users (id,email,pass_hash,role,created_at,last_login_at) VALUES (?,?,?,?,?,?)', id, email, D.hashPassword(pw), 'pro', Date.now(), Date.now());
     await run('INSERT INTO profiles (user_id,name,hours) VALUES (?,?,?)', id, name, JSON.stringify(HB.defaultHours()));
-    await run("INSERT INTO subscriptions (user_id,plan_id,started_at) VALUES (?,'free',?)", id, Date.now());
+    await run("INSERT INTO subscriptions (user_id,plan_id,started_at,renews_at) VALUES (?,'free',?,?)", id, Date.now(), Date.now() + trialDays * 864e5);
   });
   await startSession(res, id);
   return { ok: true };
@@ -192,7 +204,7 @@ route('GET', '/api/me', null, async ({ user }) => {
   const plan = await planOf(user.id);
   const used = (await get('SELECT COUNT(*) n FROM bookings WHERE user_id = ? AND created_at >= ?', user.id, monthStartMs())).n;
   const services = (await get('SELECT COUNT(*) n FROM services WHERE user_id = ?', user.id)).n;
-  return { user: base, profile: profileOut(p), plan, usage: { bookingsThisMonth: used, services } };
+  return { user: base, profile: profileOut(p), plan, access: await accessOf(user.id), usage: { bookingsThisMonth: used, services } };
 });
 
 route('POST', '/api/account/password', 'any', async ({ body, user }) => {
@@ -512,10 +524,12 @@ route('PUT', '/api/clients/:id', 'pro', async ({ params, body, user }) => {
 const publicProfile = async (slug) => {
   const p = await get('SELECT p.*, u.status AS ustatus FROM profiles p JOIN users u ON u.id = p.user_id WHERE p.slug = ? AND p.onboarded = 1', String(slug).toLowerCase());
   if (!p || p.ustatus !== 'active') throw new HttpError(404, 'Página não encontrada.');
+  p.expired = (await accessOf(p.user_id)).expired;
   return p;
 };
 route('GET', '/api/public/:slug', null, async ({ params }) => {
   const p = await publicProfile(params.slug);
+  if (p.expired) return { unavailable: true, profile: { slug: p.slug, name: p.name, business: p.business, avatar: p.avatar }, services: [], gallery: [], hours: {}, siteName: (await D.getSettings()).siteName };
   const plan = await planOf(p.user_id);
   return {
     profile: { slug: p.slug, name: p.name, business: p.business, bio: p.bio, specialties: p.specialties, address: p.address, instagram: p.instagram, avatar: p.avatar, cover: p.cover, policies: p.policies, color: plan.limits.customColor ? p.color : '', hideBrand: !!plan.limits.hideBrand, minNoticeHours: p.min_notice_hours, maxAdvanceDays: p.max_advance_days },
@@ -529,6 +543,7 @@ route('GET', '/api/public/:slug', null, async ({ params }) => {
 route('GET', '/api/public/:slug/slots', null, async ({ params, query, ip }) => {
   rateLimit('slots:' + ip, 240, 600e3);
   const p = await publicProfile(params.slug);
+  if (p.expired) throw new HttpError(403, 'Esta agenda está temporariamente indisponível.');
   const svc = await get('SELECT * FROM services WHERE id = ? AND user_id = ? AND active = 1', String(query.service || ''), p.user_id);
   if (!svc) throw bad('Serviço indisponível.');
   const c = await slotCtx(p.user_id);
@@ -546,6 +561,7 @@ route('POST', '/api/public/:slug/bookings', null, async ({ params, body, ip }) =
   rateLimit('book:' + ip, 15, 3600e3);
   if (body.website) return { ok: true }; // honeypot
   const p = await publicProfile(params.slug);
+  if (p.expired) throw new HttpError(403, 'Esta agenda está temporariamente indisponível.');
   const svc = await get('SELECT * FROM services WHERE id = ? AND user_id = ? AND active = 1', String(body.serviceId || ''), p.user_id);
   if (!svc) throw bad('Esse serviço não está mais disponível.', 'serviceId');
   if (!validDate(body.date) || !validTime(body.time)) throw bad('Escolha uma data e um horário.');
@@ -598,7 +614,7 @@ route('GET', '/api/admin/stats', 'admin', async () => {
 route('GET', '/api/admin/users', 'admin', async ({ query }) => {
   const q = '%' + String(query.q || '').toLowerCase().replace(/[%_]/g, '') + '%';
   // Somente dados de conta e contagens agregadas: nunca agendas ou clientes.
-  return { items: await all(`SELECT u.id, u.email, u.status, u.created_at, u.last_login_at, p.slug, p.name, p.onboarded, s.plan_id,
+  return { items: await all(`SELECT u.id, u.email, u.status, u.created_at, u.last_login_at, p.slug, p.name, p.onboarded, s.plan_id, s.renews_at AS access_until,
       (SELECT COUNT(*) FROM bookings b WHERE b.user_id = u.id) AS bookings,
       (SELECT COUNT(*) FROM services v WHERE v.user_id = u.id) AS services
     FROM users u LEFT JOIN profiles p ON p.user_id = u.id LEFT JOIN subscriptions s ON s.user_id = u.id
@@ -615,7 +631,12 @@ route('PATCH', '/api/admin/users/:id', 'admin', async ({ params, body }) => {
   }
   if (body.planId) {
     if (!await get('SELECT 1 FROM plans WHERE id = ?', body.planId)) throw bad('Plano inexistente.');
-    await run('INSERT INTO subscriptions (user_id,plan_id,started_at) VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET plan_id = excluded.plan_id, started_at = excluded.started_at', u.id, body.planId, Date.now());
+    await run('INSERT INTO subscriptions (user_id,plan_id,started_at,renews_at) VALUES (?,?,?,NULL) ON CONFLICT(user_id) DO UPDATE SET plan_id = excluded.plan_id, started_at = excluded.started_at, renews_at = NULL', u.id, body.planId, Date.now());
+  }
+  if ('accessUntil' in body) {
+    // data AAAA-MM-DD define o último dia de acesso; null remove o prazo (sem vencimento)
+    if (body.accessUntil !== null && !validDate(body.accessUntil)) throw bad('Data inválida.');
+    await run('UPDATE subscriptions SET renews_at = ? WHERE user_id = ?', body.accessUntil === null ? null : endOfDayMs(body.accessUntil), u.id);
   }
 });
 route('GET', '/api/admin/plans', 'admin', async () => ({ items: (await all('SELECT * FROM plans ORDER BY position')).map((p) => ({ ...planPublic(p), active: !!p.active })) }));
@@ -640,6 +661,7 @@ route('PUT', '/api/admin/settings', 'admin', async ({ body }) => {
   if ('siteName' in body) await D.setSetting('siteName', str(body.siteName, 40, 'siteName', { required: true }));
   if ('registrationOpen' in body) await D.setSetting('registrationOpen', body.registrationOpen ? '1' : '0');
   if ('baseUrl' in body) { const u = str(body.baseUrl, 120, 'baseUrl').replace(/\/+$/, ''); if (u && !/^https?:\/\/[^\s]+$/.test(u)) throw bad('Use o formato https://seudominio.com', 'baseUrl'); await D.setSetting('baseUrl', u); }
+  if ('trialDays' in body) { const n = Number(body.trialDays); if (!Number.isInteger(n) || n < 1 || n > 90) throw bad('Use entre 1 e 90 dias.', 'trialDays'); await D.setSetting('trialDays', n); }
   if ('supportWhatsapp' in body) await D.setSetting('supportWhatsapp', str(body.supportWhatsapp, 20, 'supportWhatsapp'));
 });
 
@@ -702,6 +724,11 @@ const server = http.createServer(async (req, res) => {
 if (require.main === module) {
   (async () => {
     await D.init();
+    if ((await D.getSettings()).trialMigrated !== '1') {
+      const f = HB.DEFAULT_PLANS.find((x) => x.id === 'free'); const { id, name, priceCents, active, ...rest } = f;
+      await run('UPDATE plans SET name = ?, data = ? WHERE id = ?', name, JSON.stringify(rest), 'free');
+      await D.setSetting('trialMigrated', '1');
+    }
     const admin = await D.seedAdmin();
     server.listen(PORT, () => {
       console.log('Hora Bela rodando em http://localhost:' + PORT + ' (banco: ' + D.MODE + ')');

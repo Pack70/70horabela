@@ -7,12 +7,12 @@
     const panel = u ? (u.role === 'admin' ? '/admin' : '/painel') : null;
     const cta = panel ? '<a class="btn btn-primary btn-lg" href="' + panel + '" data-link>Ir para o meu painel</a>' : '<a class="btn btn-primary btn-lg" href="/cadastro" data-link>Criar minha página grátis</a>';
     const plans = App.cfg.plans.map((p) => {
-      const price = p.priceCents ? HB.brl(p.priceCents).replace('R$ ', '') : '0';
+      const price = p.priceCents ? HB.brl(p.priceCents).replace('R$ ', '') : '0'; const days = App.cfg.trialDays || 7;
       return '<div class="plan' + (p.highlight ? ' hl' : '') + '">' + (p.highlight ? '<span class="badge">Mais escolhido</span>' : '') +
         '<div><h3>' + esc(p.name) + '</h3><p class="muted small" style="margin-top:4px">' + esc(p.tagline) + '</p></div>' +
-        '<div class="price"><small>R$</small> ' + esc(price) + ' <small>' + (p.priceCents ? '/mês' : 'para sempre') + '</small></div>' +
+        '<div class="price"><small>R$</small> ' + esc(price) + ' <small>' + (p.priceCents ? '/mês' : 'por ' + days + ' dias') + '</small></div>' +
         '<ul>' + p.features.map((f) => '<li>' + ic('check') + '<span>' + esc(f) + '</span></li>').join('') + '</ul>' +
-        '<a class="btn ' + (p.highlight ? 'btn-primary' : 'btn-line') + ' btn-block" href="' + (panel || '/cadastro') + '" data-link>' + (p.priceCents ? 'Começar grátis e fazer upgrade depois' : 'Criar minha página grátis') + '</a></div>';
+        '<a class="btn ' + (p.highlight ? 'btn-primary' : 'btn-line') + ' btn-block" href="' + (panel || '/cadastro') + '" data-link>' + (p.priceCents ? 'Começar com ' + days + ' dias grátis' : 'Testar grátis por ' + days + ' dias') + '</a></div>';
     }).join('');
 
     App.mount(`
@@ -27,7 +27,7 @@
     <h1>Sua agenda de beleza, <em>organizada em um só lugar.</em></h1>
     <p class="lead">Crie sua página de agendamento em minutos e compartilhe o link no Instagram, TikTok e WhatsApp. Suas clientes escolhem o procedimento e o horário, e você confirma pelo WhatsApp.</p>
     <div class="cta">${cta}<a class="btn btn-line btn-lg" href="#como-funciona">Ver como funciona</a></div>
-    <div class="checks"><span>${ic('check')} Sem cartão de crédito</span><span>${ic('check')} Cliente não precisa de conta</span><span>${ic('check')} Funciona no celular</span></div>
+    <div class="checks"><span>${ic('check')} ${App.cfg.trialDays || 7} dias grátis, sem cartão</span><span>${ic('check')} Cliente não precisa de conta</span><span>${ic('check')} Funciona no celular</span></div>
   </div>
   <div aria-hidden="true">
     <div class="phone"><div class="phone-in">
@@ -80,7 +80,7 @@
 </div></section>
 
 <section class="sec band" id="planos"><div class="wrap">
-  <div class="sec-head"><h2>Planos simples, que crescem com você</h2><p>Comece grátis. Faça upgrade quando precisar de mais recursos.</p></div>
+  <div class="sec-head"><h2>Planos simples, que crescem com você</h2><p>Teste grátis por ${App.cfg.trialDays || 7} dias. Depois escolha o plano ideal para o seu ritmo.</p></div>
   <div class="plans">${plans}</div>
 </div></section>
 
@@ -92,7 +92,7 @@
     <details><summary>Como funciona a confirmação pelo WhatsApp?</summary><p>Ao tocar em “Confirmar pelo WhatsApp”, a solicitação é registrada na sua agenda como pendente e o WhatsApp abre com a mensagem pronta. A cliente precisa apertar enviar. O horário só é considerado confirmado quando você aprova no painel.</p></details>
     <details><summary>E se duas clientes escolherem o mesmo horário?</summary><p>Assim que uma solicitação é registrada, o horário fica reservado por um tempo que você define (por padrão, 2 horas). Depois disso, se você não confirmar, ele volta a ficar livre.</p></details>
     <details><summary>Posso usar no Instagram e TikTok?</summary><p>Sim. Basta colocar o link da sua página na bio. Ela foi feita para abrir bem no navegador do próprio Instagram.</p></details>
-    <details><summary>Quanto custa?</summary><p>Você pode começar no plano grátis, sem cartão de crédito. Os planos pagos liberam serviços ilimitados, bloqueios de agenda e personalização.</p></details>
+    <details><summary>Quanto custa?</summary><p>Você testa grátis por ${App.cfg.trialDays || 7} dias, sem cartão de crédito. Depois é preciso assinar um plano para continuar recebendo agendamentos. Seus dados ficam guardados.</p></details>
   </div>
 </div></section>
 

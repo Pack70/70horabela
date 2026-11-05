@@ -16,6 +16,7 @@
     try { r = await fetch(url, opt); } catch (_) { const e = new Error('Sem conexão. Verifique sua internet e tente de novo.'); e.status = 0; throw e; }
     let data = null;
     try { data = await r.json(); } catch (_) { /* ignore */ }
+    if (r.status === 402 && App.me && App.me.user && App.me.access) { App.me.access.expired = true; setTimeout(() => App.route(), 0); }
     if (!r.ok) { const e = new Error((data && data.error) || 'Algo deu errado.'); e.status = r.status; e.field = data && data.field; throw e; }
     return data;
   };

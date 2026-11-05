@@ -128,6 +128,24 @@
   };
   App.acts.logout = () => App.logout();
 
+  const supportLink = (text) => App.cfg.supportWhatsapp && HB.normPhone(App.cfg.supportWhatsapp) ? App.waTo(HB.normPhone(App.cfg.supportWhatsapp), text) : '';
+  const paywall = () => {
+    const a = App.me.access; const u = App.me.user;
+    const paid = App.cfg.plans.filter((p) => p.priceCents > 0);
+    App.mount('<div class="wiz"><div class="wrap">' + App.logo('/') + '</div><div class="wiz-box" style="width:min(760px,100% - 32px)">' +
+      '<span class="eyebrow">' + ic('lock') + ' ' + (a.trial ? 'Seu teste grátis terminou' : 'Seu período de acesso terminou') + '</span>' +
+      '<h1 style="margin-top:14px">Assine para continuar recebendo agendamentos</h1>' +
+      '<p class="muted" style="margin:8px 0 22px">Seus serviços, clientes e agenda continuam guardados. Sua página pública fica indisponível até a assinatura ser ativada.</p>' +
+      '<div class="plans" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));max-width:none">' + paid.map((p) => {
+        const href = supportLink('Olá! Quero assinar o plano ' + p.name + ' do ' + App.cfg.siteName + '. Meu e-mail: ' + u.email);
+        return '<div class="plan' + (p.highlight ? ' hl' : '') + '"><div><h3>' + esc(p.name) + '</h3><p class="muted small">' + esc(p.tagline) + '</p></div><div class="price"><small>R$</small> ' + esc(HB.brl(p.priceCents).replace('R$ ', '')) + ' <small>/mês</small></div><ul>' + p.features.map((f) => '<li>' + ic('check') + '<span>' + esc(f) + '</span></li>').join('') + '</ul>' +
+          (href ? '<a class="btn btn-wa btn-block" target="_blank" rel="noopener" href="' + esc(href) + '">' + ic('whatsapp') + ' Assinar pelo WhatsApp</a>' : '<p class="small muted">Fale com o suporte para ativar este plano.</p>') + '</div>';
+      }).join('') + '</div>' +
+      '<p class="small muted" style="margin-top:18px">Logado como ' + esc(u.email) + '. Depois que o pagamento for confirmado, o acesso é liberado e você já pode entrar de novo.</p>' +
+      '<div class="row" style="margin-top:14px"><button class="btn btn-line" data-act="logout">' + ic('logout') + ' Sair</button><button class="btn btn-ghost" data-act="paywall-retry">Já assinei, verificar de novo</button></div></div></div>');
+  };
+  App.acts['paywall-retry'] = async () => { await App.loadMe(); App.route(); };
+
   const sections = {};
   const refresh = () => sections[state.section] ? sections[state.section]($('#main'), state.param) : null;
   App.refreshDash = refresh;
@@ -138,6 +156,7 @@
     if (!u) return App.go('/entrar', true);
     if (u.role !== 'pro') return App.go('/admin', true);
     if (!prof().onboarded) return App.go('/configurar', true);
+    if (App.me.access && App.me.access.expired) return paywall();
     if (section === undefined) section = '';
     if (section !== 'mais' && !sections[section]) return App.go('/painel', true);
     state.section = section; state.param = param;
@@ -156,8 +175,10 @@
     const hour = new Date().getHours();
     const hi = hour < 12 ? 'Bom dia' : hour < 18 ? 'Boa tarde' : 'Boa noite';
     const sv = await App.get('/api/services');
+    const ac = App.me.access;
+    const trialBanner = ac && ac.trial && ac.daysLeft !== null ? '<div class="card flat" style="background:' + (ac.daysLeft <= 2 ? 'var(--warn-bg)' : 'var(--rose)') + ';border-color:var(--rose2)"><div class="row between wrap-row"><div><b>Teste grátis: ' + (ac.daysLeft === 0 ? 'termina hoje' : 'faltam ' + ac.daysLeft + ' dia' + (ac.daysLeft === 1 ? '' : 's')) + '</b><p class="small" style="margin-top:2px">Depois disso é preciso assinar um plano para continuar recebendo agendamentos.</p></div><a class="btn btn-primary btn-sm" href="/painel/configuracoes" data-link>Ver planos</a></div></div>' : '';
     m.innerHTML = '<div class="page-h"><div><p class="muted">' + HB.WEEKDAYS[new Date().getDay()] + ', ' + HB.dateBR(today()).slice(0, 5) + '</p><h1>' + hi + ', ' + esc(HB.firstName(p.name)) + ' 💗</h1></div><button class="btn btn-primary" data-act="new-booking">' + ic('plus') + ' Novo agendamento</button></div>' +
-      '<div class="stack-lg">' +
+      '<div class="stack-lg">' + trialBanner +
       (sv.items.filter((s) => s.active).length ? '' : '<div class="card" style="background:var(--rose);border-color:var(--rose2)"><div class="row between wrap-row"><div><b>Cadastre seu primeiro serviço</b><p class="small" style="margin-top:2px">Sem serviços ativos, suas clientes não conseguem agendar.</p></div><a class="btn btn-primary btn-sm" href="/painel/servicos?novo=1" data-link>' + ic('plus') + ' Adicionar serviço</a></div></div>') +
       '<div class="share-card"><div style="min-width:0;flex:1"><b style="font-family:var(--serif);font-size:1.25rem;font-weight:500">Compartilhe sua agenda</b><div class="url" style="margin-top:10px">' + esc(url.replace(/^https?:\/\//, '')) + '</div></div><div class="row wrap-row"><button class="btn btn-rose btn-sm" data-act="copy-link">' + ic('copy') + ' Copiar link</button><a class="btn btn-line btn-sm" href="/painel/link" data-link style="color:var(--ink)">' + ic('share') + ' Mais opções</a></div></div>' +
       '<div class="stats"><div class="stat"><b>' + d.today.length + '</b><span>Atendimentos hoje</span></div><div class="stat' + (d.counts.pending ? ' hot' : '') + '"><b>' + d.counts.pending + '</b><span>Solicitações pendentes</span></div><div class="stat"><b>' + d.counts.confirmed + '</b><span>Confirmados</span></div><div class="stat"><b>' + d.counts.clientsServed + '</b><span>Clientes atendidas</span></div></div>' +
@@ -406,7 +427,8 @@
       '<div class="card stack"><div class="row between wrap-row"><div><b>Seu plano</b><h3 style="margin-top:2px">' + esc(plan.name) + '</h3></div><span class="chip ' + (plan.id === 'free' ? 'mute' : 'ink') + '">' + (plan.priceCents ? HB.brl(plan.priceCents) + '/mês' : 'Grátis') + '</span></div>' +
       '<ul class="small" style="margin:0;padding-left:18px;display:grid;gap:4px">' + plan.features.map((f) => '<li>' + esc(f) + '</li>').join('') + '</ul>' +
       (lim.bookingsPerMonth != null ? '<div><div class="row between small"><span>Solicitações neste mês</span><span>' + usage.bookingsThisMonth + ' de ' + lim.bookingsPerMonth + '</span></div><div class="usage" style="margin-top:6px"><i style="width:' + Math.min(100, usage.bookingsThisMonth / lim.bookingsPerMonth * 100) + '%"></i></div></div>' : '') +
-      (plan.id !== 'premium' ? '<p class="muted small">Quer mais recursos? A assinatura online chega em breve. Enquanto isso, fale com o suporte para fazer upgrade.</p>' : '') + '</div>' +
+      (App.me.access && App.me.access.endsAt ? '<p class="small">' + (App.me.access.trial ? 'Seu teste grátis termina em <b>' : 'Seu acesso vai até <b>') + HB.dateBR(HB.dstr(new Date(App.me.access.endsAt))) + '</b>.</p>' : '') +
+      (plan.id !== 'premium' ? '<p class="muted small">Para assinar ou mudar de plano, fale com o suporte.</p>' + (supportLink('Olá! Quero assinar um plano do ' + App.cfg.siteName + '. Meu e-mail: ' + user.email) ? '<a class="btn btn-wa btn-sm" style="justify-self:start" target="_blank" rel="noopener" href="' + esc(supportLink('Olá! Quero assinar um plano do ' + App.cfg.siteName + '. Meu e-mail: ' + user.email)) + '">' + ic('whatsapp') + ' Falar com o suporte</a>' : '') : '') + '</div>' +
       '<form class="card stack" id="f-email"><h3>E-mail de acesso</h3>' + App.field({ name: 'email', label: 'E-mail', type: 'email', value: user.email }) + App.field({ name: 'password', label: 'Confirme sua senha', type: 'password', auto: 'current-password' }) + '<div class="errmsg form-err"></div><div><button class="btn btn-line" type="submit">Atualizar e-mail</button></div></form>' +
       '<form class="card stack" id="f-pw"><h3>Senha</h3>' + App.field({ name: 'current', label: 'Senha atual', type: 'password', auto: 'current-password' }) + App.field({ name: 'next', label: 'Nova senha', type: 'password', auto: 'new-password', hint: 'Mínimo de 8 caracteres.' }) + '<div class="errmsg form-err"></div><div><button class="btn btn-line" type="submit">Trocar senha</button></div></form>' +
       '<form class="card stack" id="f-wa"><h3>WhatsApp de atendimento</h3>' + App.field({ name: 'whatsapp', label: 'WhatsApp com DDD', value: p.whatsapp ? HB.fmtPhone(p.whatsapp) : '', mask: 'phone', inputmode: 'tel', hint: 'Recebe as solicitações de agendamento.' }) + '<div class="errmsg form-err"></div><div><button class="btn btn-line" type="submit">Salvar WhatsApp</button></div></form>' +

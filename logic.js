@@ -79,9 +79,9 @@
 
   /* ---------- Planos e padrões ---------- */
   HB.DEFAULT_PLANS = [
-    { id: 'free', name: 'Grátis', priceCents: 0, active: true, tagline: 'Para começar a organizar sua agenda.',
+    { id: 'free', name: 'Teste grátis', priceCents: 0, active: true, tagline: 'Experimente por 7 dias, sem cartão de crédito.',
       limits: { services: 5, bookingsPerMonth: 30, gallery: 6, customColor: false, hideBrand: false },
-      features: ['Página de agendamento com link próprio', 'Até 5 serviços', 'Até 30 solicitações por mês', 'Confirmação pelo WhatsApp', 'Galeria com 6 fotos'] },
+      features: ['7 dias grátis para testar', 'Página de agendamento com link próprio', 'Até 5 serviços', 'Até 30 solicitações por mês', 'Confirmação pelo WhatsApp', 'Galeria com 6 fotos'] },
     { id: 'pro', name: 'Profissional', priceCents: 2990, active: true, highlight: true, tagline: 'Agenda completa para o dia a dia.',
       limits: { services: null, bookingsPerMonth: null, gallery: 12, customColor: false, hideBrand: false },
       features: ['Serviços ilimitados', 'Solicitações ilimitadas', 'Folgas, férias e bloqueios', 'Histórico de clientes', 'Galeria com 12 fotos'] },

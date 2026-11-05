@@ -30,17 +30,24 @@
 
   sections.contas = async (m) => {
     const [{ items }, { items: plans }] = await Promise.all([App.get('/api/admin/users?q=' + encodeURIComponent(S.q || '')), App.get('/api/admin/plans')]);
-    m.innerHTML = '<div class="page-h"><div><h1>Contas</h1><p class="muted">' + items.length + ' profissional(is)</p></div></div><input class="input" id="aq" placeholder="Buscar por nome, e-mail ou link" value="' + esc(S.q || '') + '" style="margin-bottom:14px"><div class="card tbl-scroll" style="padding:6px"><table class="tbl"><thead><tr><th>Profissional</th><th>Link</th><th>Plano</th><th>Uso</th><th>Cadastro</th><th>Status</th><th></th></tr></thead><tbody>' +
+    m.innerHTML = '<div class="page-h"><div><h1>Contas</h1><p class="muted">' + items.length + ' profissional(is)</p></div></div><input class="input" id="aq" placeholder="Buscar por nome, e-mail ou link" value="' + esc(S.q || '') + '" style="margin-bottom:14px"><div class="card tbl-scroll" style="padding:6px"><table class="tbl"><thead><tr><th>Profissional</th><th>Link</th><th>Plano</th><th>Acesso até</th><th>Uso</th><th>Cadastro</th><th>Status</th><th></th></tr></thead><tbody>' +
       items.map((u) => '<tr><td><b>' + esc(u.name || '—') + '</b><br><span class="muted tiny">' + esc(u.email) + '</span></td><td>' + (u.slug ? '<a href="/' + esc(u.slug) + '" target="_blank" rel="noopener">/' + esc(u.slug) + '</a>' : '<span class="muted tiny">não configurado</span>') + '</td>' +
-        '<td><select class="input" style="min-height:38px;padding:6px 10px" data-act="u-plan" data-id="' + u.id + '">' + plans.map((p) => '<option value="' + p.id + '"' + (p.id === u.plan_id ? ' selected' : '') + '>' + esc(p.name) + '</option>').join('') + '</select></td><td class="small">' + u.services + ' serv. · ' + u.bookings + ' solic.</td><td class="small">' + fmtDT(u.created_at) + '</td>' +
+        '<td><select class="input" style="min-height:38px;padding:6px 10px" data-act="u-plan" data-id="' + u.id + '">' + plans.map((p) => '<option value="' + p.id + '"' + (p.id === u.plan_id ? ' selected' : '') + '>' + esc(p.name) + '</option>').join('') + '</select></td><td class="small">' + (u.access_until ? '<span class="chip ' + (u.access_until < Date.now() ? 'bad' : 'mute') + '">' + new Date(u.access_until).toLocaleDateString('pt-BR') + (u.access_until < Date.now() ? ' · vencido' : '') + '</span>' : '<span class="muted">sem prazo</span>') + '<br><button class="btn btn-ghost btn-sm" data-act="u-term" data-id="' + u.id + '" data-until="' + (u.access_until || '') + '">Alterar prazo</button></td><td class="small">' + u.services + ' serv. · ' + u.bookings + ' solic.</td><td class="small">' + fmtDT(u.created_at) + '</td>' +
         '<td><span class="chip ' + (u.status === 'active' ? 'ok' : 'bad') + '">' + (u.status === 'active' ? 'Ativa' : 'Suspensa') + '</span></td><td><button class="btn btn-sm ' + (u.status === 'active' ? 'btn-danger' : 'btn-line') + '" data-act="u-status" data-id="' + u.id + '" data-to="' + (u.status === 'active' ? 'suspended' : 'active') + '">' + (u.status === 'active' ? 'Suspender' : 'Reativar') + '</button></td></tr>').join('') +
-      (items.length ? '' : '<tr><td colspan="7" class="muted" style="text-align:center;padding:30px">Nenhuma conta encontrada.</td></tr>') + '</tbody></table></div>';
+      (items.length ? '' : '<tr><td colspan="8" class="muted" style="text-align:center;padding:30px">Nenhuma conta encontrada.</td></tr>') + '</tbody></table></div>';
     let t; $('#aq').addEventListener('input', (e) => { clearTimeout(t); t = setTimeout(async () => { S.q = e.target.value; await refresh(); const i = $('#aq'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 350); });
   };
   App.acts['u-status'] = async (el) => {
     const to = el.dataset.to;
     if (to === 'suspended' && !(await App.confirm('Suspender esta conta?', 'A profissional perde o acesso e a página pública sai do ar até a reativação.', 'Suspender', true))) return;
     try { await App.patch('/api/admin/users/' + el.dataset.id, { status: to }); App.toast(to === 'active' ? 'Conta reativada.' : 'Conta suspensa.'); refresh(); } catch (e) { App.toast(e.message, true); }
+  };
+  App.acts['u-term'] = (el) => {
+    const cur = el.dataset.until ? HB.dstr(new Date(Number(el.dataset.until))) : '';
+    const m = App.modal(App.sheetHead('Prazo de acesso', 'Último dia em que a profissional pode usar a agenda.') + '<form class="stack" novalidate><div class="field"><label>Acesso até</label><input class="input" type="date" name="until" value="' + cur + '"></div><div class="row wrap-row"><button class="btn btn-line btn-sm" type="button" data-add="30">+30 dias</button><button class="btn btn-line btn-sm" type="button" data-add="365">+1 ano</button><button class="btn btn-line btn-sm" type="button" data-add="0">Sem prazo</button></div><div class="errmsg form-err"></div><button class="btn btn-primary btn-block" type="submit">Salvar</button></form>');
+    const f = $('form', m);
+    App.$$('[data-add]', f).forEach((b) => b.addEventListener('click', () => { const n = Number(b.dataset.add); if (!n) { f.until.value = ''; return; } const base = f.until.value && f.until.value > HB.dstr(new Date()) ? f.until.value : HB.dstr(new Date()); f.until.value = HB.addDays(base, n); }));
+    f.addEventListener('submit', async (e) => { e.preventDefault(); try { await App.patch('/api/admin/users/' + el.dataset.id, { accessUntil: f.until.value || null }); m.close(); App.toast('Prazo atualizado.'); refresh(); } catch (err) { App.showErr(f, err); } });
   };
   document.addEventListener('change', async (e) => {
     const t = e.target; if (!t.matches || !t.matches('[data-act=u-plan]')) return;
@@ -80,13 +87,14 @@
     m.innerHTML = '<div class="page-h"><h1>Configuração geral</h1></div><form class="card stack" id="f-sys">' +
       App.field({ name: 'siteName', label: 'Nome da plataforma', value: s.siteName, max: 40 }) +
       App.field({ name: 'baseUrl', label: 'Endereço público (domínio próprio)', value: s.baseUrl, ph: 'https://horabela.com.br', hint: 'Usado nos links compartilhados e nas prévias do Instagram/WhatsApp. Deixe vazio para usar o endereço atual.' }) +
-      App.field({ name: 'supportWhatsapp', label: 'WhatsApp do suporte', value: s.supportWhatsapp, max: 20 }) +
+      App.field({ name: 'supportWhatsapp', label: 'WhatsApp do suporte e das assinaturas', value: s.supportWhatsapp, max: 20, mask: 'phone', hint: 'Aparece na tela de assinatura para quem terminou o teste. Preencha para receber os pedidos de assinatura.' }) +
+      App.field({ name: 'trialDays', label: 'Dias de teste grátis', value: s.trialDays, inputmode: 'numeric', hint: 'Vale para novos cadastros.' }) +
       '<label class="row"><span class="switch"><input type="checkbox" name="registrationOpen" ' + (s.registrationOpen === '1' ? 'checked' : '') + '><i></i></span> Aceitar novos cadastros</label><div class="errmsg form-err"></div><div><button class="btn btn-primary" type="submit">Salvar configurações</button></div></form>';
     const f = $('#f-sys');
     f.addEventListener('submit', async (e) => {
       e.preventDefault(); App.showErr(f);
       await App.busy(f.querySelector('button[type=submit]'), async () => {
-        try { await App.put('/api/admin/settings', { siteName: f.siteName.value, baseUrl: f.baseUrl.value, supportWhatsapp: f.supportWhatsapp.value, registrationOpen: f.registrationOpen.checked }); App.cfg.siteName = f.siteName.value; App.toast('Configurações salvas.'); }
+        try { await App.put('/api/admin/settings', { siteName: f.siteName.value, baseUrl: f.baseUrl.value, supportWhatsapp: f.supportWhatsapp.value, trialDays: Number(f.trialDays.value), registrationOpen: f.registrationOpen.checked }); App.cfg.siteName = f.siteName.value; App.toast('Configurações salvas.'); }
         catch (err) { App.showErr(f, err); }
       });
     });

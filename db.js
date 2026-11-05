@@ -265,7 +265,7 @@ const seedPlans = async () => {
     await run('INSERT INTO plans (id,name,price_cents,active,position,data) VALUES (?,?,?,?,?,?)', id, name, priceCents, active ? 1 : 0, i++, JSON.stringify(rest));
   }
 };
-const DEFAULT_SETTINGS = { siteName: 'Hora Bela', registrationOpen: '1', supportWhatsapp: '', baseUrl: '' };
+const DEFAULT_SETTINGS = { siteName: 'Hora Bela', registrationOpen: '1', supportWhatsapp: '', baseUrl: '', trialDays: '7' };
 const getSettings = async () => {
   const s = { ...DEFAULT_SETTINGS };
   for (const r of await all('SELECT key,value FROM settings')) s[r.key] = r.value;
