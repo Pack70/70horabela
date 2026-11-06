@@ -341,12 +341,12 @@ const caktoAuthentic = (req, body) => {
   const sig = String(req.headers['x-cakto-signature'] || '').replace(/^v1=/, ''), ts = String(req.headers['x-cakto-timestamp'] || '');
   if (sig && ts) {
     const n = Number(ts); const ms = n < 1e12 ? n * 1000 : n;
-    if (!Number.isFinite(ms) || Math.abs(Date.now() - ms) > 5 * 60e3) return false;
+    if (Number.isFinite(ms) && Math.abs(Date.now() - ms) > 5 * 60e3) return typeof body.secret === 'string' && safeEq(body.secret, secret);
     const mac = () => crypto.createHmac('sha256', secret).update(ts + '.').update(req.rawBody || '');
     const hex = mac().digest('hex'), b64 = mac().digest('base64');
-    return safeEq(sig, hex) || safeEq(sig, b64);
+    if (safeEq(sig, hex) || safeEq(sig, b64)) return true;
   }
-  return typeof body.secret === 'string' && safeEq(body.secret, secret);
+  return typeof body.secret === 'string' && safeEq(body.secret, secret); // método alternativo documentado pela Cakto
 };
 const CAKTO_PAID = new Set(['purchase_approved', 'subscription_renewed', 'subscription_late_recovered']);
 const CAKTO_STOP = new Set(['subscription_canceled', 'subscription_paused']);
@@ -362,16 +362,17 @@ const caktoPlanFor = async (d) => {
 const handleCakto = async (event, d) => {
   const email = String((d.customer && d.customer.email) || '').trim().toLowerCase();
   const user = email && await get("SELECT id FROM users WHERE lower(email) = ? AND role = 'pro'", email);
-  if (!user) { await D.logError('cakto ' + event, new Error('Nenhuma conta com o e-mail da compra: ' + email + ' (pedido ' + d.id + ')')); return; }
+  if (!user) { console.log('[cakto] sem conta para ' + email); await D.logError('cakto ' + event, new Error('Nenhuma conta com o e-mail da compra: ' + email + ' (pedido ' + d.id + ')')); return; }
   const cur = await get('SELECT * FROM subscriptions WHERE user_id = ?', user.id);
   const now = Date.now();
   if (CAKTO_PAID.has(event)) {
     if (d.status && d.status !== 'paid') return;
     const planId = await caktoPlanFor(d);
-    if (!planId) { await D.logError('cakto ' + event, new Error('Plano não identificado (oferta ' + (d.offer && d.offer.id) + ', valor ' + d.amount + '). Preencha o ID da oferta em Admin → Sistema.')); return; }
+    if (!planId) { console.log('[cakto] plano não identificado'); await D.logError('cakto ' + event, new Error('Plano não identificado (oferta ' + (d.offer && d.offer.id) + ', valor ' + d.amount + '). Preencha o ID da oferta em Admin → Sistema.')); return; }
     const ends = Math.max(cur && cur.renews_at ? Number(cur.renews_at) : 0, now + 33 * 864e5); // 30 dias + 3 de tolerância; nunca soma, então é idempotente
     if (cur && cur.provider === 'mercadopago' && cur.status === 'active' && cur.provider_ref && MP.enabled()) { try { await MP.cancelPreapproval(cur.provider_ref); } catch (e) { await D.logError('mp cancel (troca p/ cakto)', e); } }
     const ref = String(d.subscription && typeof d.subscription === 'object' && d.subscription.id ? d.subscription.id : d.id || '');
+    console.log('[cakto] liberando plano ' + planId + ' para ' + email);
     await run("INSERT INTO subscriptions (user_id,plan_id,status,provider,provider_ref,started_at,renews_at) VALUES (?,?, 'active','cakto',?,?,?) ON CONFLICT(user_id) DO UPDATE SET plan_id = excluded.plan_id, status = 'active', provider = 'cakto', provider_ref = excluded.provider_ref, renews_at = excluded.renews_at", user.id, planId, ref, now, ends);
   } else if (CAKTO_STOP.has(event) && cur && cur.provider === 'cakto') {
     await run("UPDATE subscriptions SET status = 'cancelled' WHERE user_id = ?", user.id); // acesso segue até renews_at
@@ -380,8 +381,11 @@ const handleCakto = async (event, d) => {
   }
 };
 route('POST', '/api/billing/cakto', null, async ({ req, body }) => {
-  if (!caktoAuthentic(req, body)) throw new HttpError(401, 'Assinatura inválida.');
   const event = String(body.event || '');
+  const ok = caktoAuthentic(req, body);
+  const first = [].concat(body.data || [])[0] || {};
+  console.log('[cakto] evento=' + event + ' autêntico=' + ok + ' assinatura=' + !!req.headers['x-cakto-signature'] + ' segredoNoCorpo=' + (typeof body.secret === 'string') + ' email=' + String((first.customer && first.customer.email) || '') + ' oferta=' + String((first.offer && first.offer.id) || '') + ' valor=' + first.amount);
+  if (!ok) throw new HttpError(401, 'Assinatura inválida.');
   for (const d of [].concat(body.data || [])) if (d && typeof d === 'object') await handleCakto(event, d);
   return { ok: true };
 });
